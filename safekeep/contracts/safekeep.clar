@@ -1,4 +1,4 @@
-;; SafeKeep: Time-Locked Multi-Signature Vault
+;; SafeKeep: Time-Locked Multi-Signature Vault with Emergency Unlock
 ;; A secure smart contract for conditional asset storage and controlled release
 
 (define-constant ERR-NOT-AUTHORIZED (err u1))
@@ -6,6 +6,8 @@
 (define-constant ERR-TIME-LOCK-NOT-EXPIRED (err u3))
 (define-constant ERR-INVALID-SIGNER (err u4))
 (define-constant ERR-ALREADY-SIGNED (err u5))
+(define-constant ERR-EMERGENCY-UNLOCK-NOT-ALLOWED (err u6))
+(define-constant ERR-GUARDIAN-REQUIRED (err u7))
 
 ;; Vault configuration
 (define-map vault-config
@@ -15,7 +17,10 @@
     required-signatures: uint,
     signers: (list 5 principal),
     total-amount: uint,
-    signed-signers: (list 5 principal)
+    signed-signers: (list 5 principal),
+    guardian: (optional principal),
+    emergency-unlock-enabled: bool,
+    emergency-unlock-after: (optional uint)
   }
 )
 
@@ -25,12 +30,15 @@
   { has-signed: bool }
 )
 
-;; Create a new time-locked multi-sig vault
+;; Create a new time-locked multi-sig vault with optional emergency unlock
 (define-public (create-vault 
   (release-timestamp uint)
   (required-signatures uint)
   (signers (list 5 principal))
-  (initial-deposit uint))
+  (initial-deposit uint)
+  (guardian (optional principal))
+  (emergency-unlock-enabled bool)
+  (emergency-unlock-after (optional uint)))
   (let 
     (
       (vault-id (var-get next-vault-id))
@@ -39,6 +47,15 @@
     ;; Validate input parameters
     (asserts! (> required-signatures u0) ERR-INVALID-SIGNER)
     (asserts! (<= required-signatures (len signers)) ERR-INSUFFICIENT-SIGNATURES)
+    
+    ;; If emergency unlock is enabled, guardian is required
+    (asserts! 
+      (if emergency-unlock-enabled 
+        (is-some guardian) 
+        true
+      ) 
+      ERR-GUARDIAN-REQUIRED
+    )
     
     ;; Transfer initial deposit to contract
     (try! (stx-transfer? initial-deposit sender (as-contract tx-sender)))
@@ -51,7 +68,10 @@
         required-signatures: required-signatures,
         signers: signers,
         total-amount: initial-deposit,
-        signed-signers: (list)
+        signed-signers: (list),
+        guardian: guardian,
+        emergency-unlock-enabled: emergency-unlock-enabled,
+        emergency-unlock-after: emergency-unlock-after
       }
     )
     
@@ -88,6 +108,38 @@
     )
     
     (ok true)
+  )
+)
+
+;; Emergency unlock by guardian
+(define-public (emergency-unlock (vault-id uint))
+  (let 
+    (
+      (vault (unwrap! (map-get? vault-config { vault-id: vault-id }) ERR-NOT-AUTHORIZED))
+      (sender tx-sender)
+    )
+    ;; Check emergency unlock is enabled
+    (asserts! (get emergency-unlock-enabled vault) ERR-EMERGENCY-UNLOCK-NOT-ALLOWED)
+    
+    ;; Verify sender is the guardian
+    (asserts! 
+      (is-eq sender (unwrap! (get guardian vault) ERR-NOT-AUTHORIZED)) 
+      ERR-NOT-AUTHORIZED
+    )
+    
+    ;; Check emergency unlock conditions
+    (asserts! 
+      (match (get emergency-unlock-after vault)
+        unlock-block (>= block-height unlock-block)
+        true
+      )
+      ERR-EMERGENCY-UNLOCK-NOT-ALLOWED
+    )
+    
+    ;; Transfer funds to guardian
+    (as-contract 
+      (stx-transfer? (get total-amount vault) tx-sender sender)
+    )
   )
 )
 
