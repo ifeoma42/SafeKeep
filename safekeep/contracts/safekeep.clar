@@ -1,4 +1,4 @@
-;; SafeKeep: Time-Locked Multi-Signature Vault with Emergency Unlock
+;; SafeKeep: Time-Locked Multi-Signature Vault with Partial Withdrawals
 ;; A secure smart contract for conditional asset storage and controlled release
 
 (define-constant ERR-NOT-AUTHORIZED (err u1))
@@ -8,6 +8,8 @@
 (define-constant ERR-ALREADY-SIGNED (err u5))
 (define-constant ERR-EMERGENCY-UNLOCK-NOT-ALLOWED (err u6))
 (define-constant ERR-GUARDIAN-REQUIRED (err u7))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u8))
+(define-constant ERR-INVALID-WITHDRAWAL-AMOUNT (err u9))
 
 ;; Vault configuration
 (define-map vault-config
@@ -17,20 +19,36 @@
     required-signatures: uint,
     signers: (list 5 principal),
     total-amount: uint,
+    withdrawn-amount: uint,
     signed-signers: (list 5 principal),
     guardian: (optional principal),
     emergency-unlock-enabled: bool,
-    emergency-unlock-after: (optional uint)
+    emergency-unlock-after: (optional uint),
+    partial-withdrawal-config: {
+      partial-unlock-threshold: uint,
+      partial-signatures-required: uint
+    }
   }
 )
 
-;; Track individual vault signatures
-(define-map vault-signatures
-  { vault-id: uint, signer: principal }
+;; Track individual vault signatures for partial withdrawals
+(define-map partial-withdrawal-signatures
+  { vault-id: uint, withdrawal-id: uint, signer: principal }
   { has-signed: bool }
 )
 
-;; Create a new time-locked multi-sig vault with optional emergency unlock
+;; Track partial withdrawal requests
+(define-map partial-withdrawal-requests
+  { vault-id: uint, withdrawal-id: uint }
+  {
+    amount: uint,
+    signed-signers: (list 5 principal),
+    approved: bool,
+    recipient: principal
+  }
+)
+
+;; Create a new time-locked multi-sig vault with partial withdrawal support
 (define-public (create-vault 
   (release-timestamp uint)
   (required-signatures uint)
@@ -38,7 +56,9 @@
   (initial-deposit uint)
   (guardian (optional principal))
   (emergency-unlock-enabled bool)
-  (emergency-unlock-after (optional uint)))
+  (emergency-unlock-after (optional uint))
+  (partial-unlock-threshold uint)
+  (partial-signatures-required uint))
   (let 
     (
       (vault-id (var-get next-vault-id))
@@ -47,6 +67,7 @@
     ;; Validate input parameters
     (asserts! (> required-signatures u0) ERR-INVALID-SIGNER)
     (asserts! (<= required-signatures (len signers)) ERR-INSUFFICIENT-SIGNATURES)
+    (asserts! (<= partial-signatures-required required-signatures) ERR-INVALID-SIGNER)
     
     ;; If emergency unlock is enabled, guardian is required
     (asserts! 
@@ -68,10 +89,15 @@
         required-signatures: required-signatures,
         signers: signers,
         total-amount: initial-deposit,
+        withdrawn-amount: u0,
         signed-signers: (list),
         guardian: guardian,
         emergency-unlock-enabled: emergency-unlock-enabled,
-        emergency-unlock-after: emergency-unlock-after
+        emergency-unlock-after: emergency-unlock-after,
+        partial-withdrawal-config: {
+          partial-unlock-threshold: partial-unlock-threshold,
+          partial-signatures-required: partial-signatures-required
+        }
       }
     )
     
@@ -82,28 +108,138 @@
   )
 )
 
-;; Sign the vault for release
-(define-public (sign-vault (vault-id uint))
+;; Request a partial withdrawal
+(define-public (request-partial-withdrawal (vault-id uint) (amount uint) (recipient principal))
   (let 
     (
       (vault (unwrap! (map-get? vault-config { vault-id: vault-id }) ERR-NOT-AUTHORIZED))
       (sender tx-sender)
+      (withdrawal-id (var-get next-withdrawal-id))
+      (partial-config (get partial-withdrawal-config vault))
+    )
+    ;; Validate withdrawal amount
+    (asserts! 
+      (>= 
+        (- (get total-amount vault) (get withdrawn-amount vault)) 
+        amount
+      ) 
+      ERR-INSUFFICIENT-BALANCE
+    )
+    (asserts! (> amount u0) ERR-INVALID-WITHDRAWAL-AMOUNT)
+    (asserts! 
+      (<= amount (/ (get total-amount vault) (get partial-unlock-threshold partial-config))) 
+      ERR-INVALID-WITHDRAWAL-AMOUNT
+    )
+    
+    ;; Create partial withdrawal request
+    (map-set partial-withdrawal-requests
+      { vault-id: vault-id, withdrawal-id: withdrawal-id }
+      {
+        amount: amount,
+        signed-signers: (list),
+        approved: false,
+        recipient: recipient
+      }
+    )
+    
+    ;; Increment withdrawal ID
+    (var-set next-withdrawal-id (+ withdrawal-id u1))
+    
+    (ok withdrawal-id)
+  )
+)
+
+;; Sign a partial withdrawal request
+(define-public (sign-partial-withdrawal (vault-id uint) (withdrawal-id uint))
+  (let 
+    (
+      (vault (unwrap! (map-get? vault-config { vault-id: vault-id }) ERR-NOT-AUTHORIZED))
+      (withdrawal-req (unwrap! 
+        (map-get? partial-withdrawal-requests { vault-id: vault-id, withdrawal-id: withdrawal-id }) 
+        ERR-NOT-AUTHORIZED
+      ))
+      (sender tx-sender)
+      (partial-config (get partial-withdrawal-config vault))
     )
     ;; Validate signer
     (asserts! (is-some (index-of (get signers vault) sender)) ERR-NOT-AUTHORIZED)
-    (asserts! (is-none (map-get? vault-signatures { vault-id: vault-id, signer: sender })) ERR-ALREADY-SIGNED)
+    (asserts! 
+      (is-none (map-get? partial-withdrawal-signatures { 
+        vault-id: vault-id, 
+        withdrawal-id: withdrawal-id, 
+        signer: sender 
+      })) 
+      ERR-NOT-AUTHORIZED
+    )
     
     ;; Record signature
-    (map-set vault-signatures 
-      { vault-id: vault-id, signer: sender }
+    (map-set partial-withdrawal-signatures 
+      { 
+        vault-id: vault-id, 
+        withdrawal-id: withdrawal-id, 
+        signer: sender 
+      }
       { has-signed: true }
     )
     
-    ;; Update signed signers list
+    ;; Update signed signers for withdrawal request
+    (map-set partial-withdrawal-requests
+      { vault-id: vault-id, withdrawal-id: withdrawal-id }
+      (merge withdrawal-req { 
+        signed-signers: (unwrap-panic (as-max-len? 
+          (append (get signed-signers withdrawal-req) sender) 
+          u5
+        )) 
+      })
+    )
+    
+    ;; Check if withdrawal can be approved
+    (if (>= (len (get signed-signers withdrawal-req)) (get partial-signatures-required partial-config))
+      (begin
+        ;; Mark withdrawal as approved
+        (map-set partial-withdrawal-requests
+          { vault-id: vault-id, withdrawal-id: withdrawal-id }
+          (merge withdrawal-req { approved: true })
+        )
+        true
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute approved partial withdrawal
+(define-public (execute-partial-withdrawal (vault-id uint) (withdrawal-id uint))
+  (let 
+    (
+      (vault (unwrap! (map-get? vault-config { vault-id: vault-id }) ERR-NOT-AUTHORIZED))
+      (withdrawal-req (unwrap! 
+        (map-get? partial-withdrawal-requests { vault-id: vault-id, withdrawal-id: withdrawal-id }) 
+        ERR-NOT-AUTHORIZED
+      ))
+      (partial-config (get partial-withdrawal-config vault))
+    )
+    ;; Validate withdrawal is approved
+    (asserts! (get approved withdrawal-req) ERR-NOT-AUTHORIZED)
+    
+    ;; Transfer partial withdrawal amount
+    (try! 
+      (as-contract 
+        (stx-transfer? 
+          (get amount withdrawal-req) 
+          tx-sender 
+          (get recipient withdrawal-req)
+        )
+      )
+    )
+    
+    ;; Update vault total and withdrawn amounts
     (map-set vault-config 
       { vault-id: vault-id }
       (merge vault { 
-        signed-signers: (unwrap-panic (as-max-len? (append (get signed-signers vault) sender) u5)) 
+        withdrawn-amount: (+ (get withdrawn-amount vault) (get amount withdrawal-req)) 
       })
     )
     
@@ -111,83 +247,9 @@
   )
 )
 
-;; Emergency unlock by guardian
-(define-public (emergency-unlock (vault-id uint))
-  (let 
-    (
-      (vault (unwrap! (map-get? vault-config { vault-id: vault-id }) ERR-NOT-AUTHORIZED))
-      (sender tx-sender)
-    )
-    ;; Check emergency unlock is enabled
-    (asserts! (get emergency-unlock-enabled vault) ERR-EMERGENCY-UNLOCK-NOT-ALLOWED)
-    
-    ;; Verify sender is the guardian
-    (asserts! 
-      (is-eq sender (unwrap! (get guardian vault) ERR-NOT-AUTHORIZED)) 
-      ERR-NOT-AUTHORIZED
-    )
-    
-    ;; Check emergency unlock conditions
-    (asserts! 
-      (match (get emergency-unlock-after vault)
-        unlock-block (>= block-height unlock-block)
-        true
-      )
-      ERR-EMERGENCY-UNLOCK-NOT-ALLOWED
-    )
-    
-    ;; Transfer funds to guardian
-    (as-contract 
-      (stx-transfer? (get total-amount vault) tx-sender sender)
-    )
-  )
-)
-
-;; Withdraw funds from the vault
-(define-public (withdraw-vault (vault-id uint))
-  (let 
-    (
-      (vault (unwrap! (map-get? vault-config { vault-id: vault-id }) ERR-NOT-AUTHORIZED))
-      (sender tx-sender)
-    )
-    ;; Check time lock has expired
-    (asserts! (>= block-height (get release-timestamp vault)) ERR-TIME-LOCK-NOT-EXPIRED)
-    
-    ;; Check signature threshold met
-    (asserts! 
-      (>= (len (get signed-signers vault)) (get required-signatures vault)) 
-      ERR-INSUFFICIENT-SIGNATURES
-    )
-    
-    ;; Transfer funds back to sender
-    (as-contract 
-      (stx-transfer? (get total-amount vault) tx-sender sender)
-    )
-  )
-)
-
-;; Allow depositing additional funds to an existing vault
-(define-public (deposit-to-vault (vault-id uint) (amount uint))
-  (let 
-    (
-      (vault (unwrap! (map-get? vault-config { vault-id: vault-id }) ERR-NOT-AUTHORIZED))
-      (sender tx-sender)
-    )
-    ;; Transfer additional funds
-    (try! (stx-transfer? amount sender (as-contract tx-sender)))
-    
-    ;; Update total amount
-    (map-set vault-config 
-      { vault-id: vault-id }
-      (merge vault { total-amount: (+ (get total-amount vault) amount) })
-    )
-    
-    (ok true)
-  )
-)
-
-;; Initialize the next vault ID
+;; Initialize counters
 (define-data-var next-vault-id uint u1)
+(define-data-var next-withdrawal-id uint u1)
 
 ;; Read-only function to check vault details
 (define-read-only (get-vault-details (vault-id uint))
